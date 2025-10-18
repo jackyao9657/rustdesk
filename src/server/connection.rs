@@ -50,8 +50,10 @@ use serde_json::{json, value::Value};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::sync::atomic::Ordering;
 use std::{
+    net::Ipv6Addr,
     num::NonZeroI64,
     path::PathBuf,
+    str::FromStr,
     sync::{atomic::AtomicI64, mpsc as std_mpsc},
 };
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -126,9 +128,18 @@ pub struct ConnInner {
     tx_video: Option<Sender>,
 }
 
+struct InputMouse {
+    msg: MouseEvent,
+    conn_id: i32,
+    username: String,
+    argb: u32,
+    simulate: bool,
+    show_cursor: bool,
+}
+
 enum MessageInput {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    Mouse((MouseEvent, i32)),
+    Mouse(InputMouse),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     Key((KeyEvent, bool)),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -225,6 +236,9 @@ pub struct Connection {
     // by peer
     disable_keyboard: bool,
     // by peer
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    show_my_cursor: bool,
+    // by peer
     disable_clipboard: bool,
     // by peer
     disable_audio: bool,
@@ -240,6 +254,7 @@ pub struct Connection {
     server_audit_conn: String,
     server_audit_file: String,
     lr: LoginRequest,
+    peer_argb: u32,
     session_last_recv_time: Option<Arc<Mutex<Instant>>>,
     chat_unanswered: bool,
     file_transferred: bool,
@@ -403,11 +418,14 @@ impl Connection {
             enable_file_transfer: false,
             disable_clipboard: false,
             disable_keyboard: false,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            show_my_cursor: false,
             tx_input,
             video_ack_required: false,
             server_audit_conn: "".to_owned(),
             server_audit_file: "".to_owned(),
             lr: Default::default(),
+            peer_argb: 0u32,
             session_last_recv_time: None,
             chat_unanswered: false,
             file_transferred: false,
@@ -633,7 +651,25 @@ impl Connection {
                         }
                         #[cfg(target_os = "windows")]
                         ipc::Data::ClipboardFile(clip) => {
-                            allow_err!(conn.stream.send(&clip_2_msg(clip)).await);
+                            if !conn.is_remote() {
+                                continue;
+                            }
+                            match clip {
+                                clipboard::ClipboardFile::Files { files } => {
+                                    let files = files.into_iter().map(|(f, s)| {
+                                        (f, s as i64)
+                                    }).collect::<Vec<_>>();
+                                    conn.post_file_audit(
+                                        FileAuditType::RemoteSend,
+                                        "",
+                                        files,
+                                        json!({}),
+                                    );
+                                }
+                                _ => {
+                                    allow_err!(conn.stream.send(&clip_2_msg(clip)).await);
+                                }
+                            }
                         }
                         ipc::Data::PrivacyModeState((_, state, impl_key)) => {
                             let msg_out = match state {
@@ -923,8 +959,15 @@ impl Connection {
         loop {
             match receiver.recv_timeout(std::time::Duration::from_millis(500)) {
                 Ok(v) => match v {
-                    MessageInput::Mouse((msg, id)) => {
-                        handle_mouse(&msg, id);
+                    MessageInput::Mouse(mouse_input) => {
+                        handle_mouse(
+                            &mouse_input.msg,
+                            mouse_input.conn_id,
+                            mouse_input.username,
+                            mouse_input.argb,
+                            mouse_input.simulate,
+                            mouse_input.show_cursor,
+                        );
                     }
                     MessageInput::Key((mut msg, press)) => {
                         // Set the press state to false, use `down` only in `handle_key()`.
@@ -1769,8 +1812,25 @@ impl Connection {
 
     #[inline]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    fn input_mouse(&self, msg: MouseEvent, conn_id: i32) {
-        self.tx_input.send(MessageInput::Mouse((msg, conn_id))).ok();
+    fn input_mouse(
+        &self,
+        msg: MouseEvent,
+        conn_id: i32,
+        username: String,
+        argb: u32,
+        simulate: bool,
+        show_cursor: bool,
+    ) {
+        self.tx_input
+            .send(MessageInput::Mouse(InputMouse {
+                msg,
+                conn_id,
+                username,
+                argb,
+                simulate,
+                show_cursor,
+            }))
+            .ok();
     }
 
     #[inline]
@@ -1885,6 +1945,7 @@ impl Connection {
 
     async fn handle_login_request_without_validation(&mut self, lr: &LoginRequest) {
         self.lr = lr.clone();
+        self.peer_argb = crate::str2color(&format!("{}{}", &lr.my_id, &lr.my_platform), 0xff);
         if let Some(o) = lr.option.as_ref() {
             self.options_in_login = Some(o.clone());
         }
@@ -2264,7 +2325,25 @@ impl Connection {
                         }
                         #[cfg(target_os = "macos")]
                         self.retina.on_mouse_event(&mut me, self.display_idx);
-                        self.input_mouse(me, self.inner.id());
+                        self.input_mouse(
+                            me,
+                            self.inner.id(),
+                            self.lr.my_name.clone(),
+                            self.peer_argb,
+                            true,
+                            self.show_my_cursor,
+                        );
+                    } else if self.show_my_cursor {
+                        #[cfg(target_os = "macos")]
+                        self.retina.on_mouse_event(&mut me, self.display_idx);
+                        self.input_mouse(
+                            me,
+                            self.inner.id(),
+                            self.lr.my_name.clone(),
+                            self.peer_argb,
+                            false,
+                            true,
+                        );
                     }
                     self.update_auto_disconnect_timer();
                 }
@@ -2463,14 +2542,25 @@ impl Connection {
                 }
                 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
                 Some(message::Union::Cliprdr(clip)) => {
-                    if let Some(clip) = msg_2_clip(clip) {
+                    if let Some(cliprdr::Union::Files(files)) = &clip.union {
+                        self.post_file_audit(
+                            FileAuditType::RemoteReceive,
+                            "",
+                            files
+                                .files
+                                .iter()
+                                .map(|f| (f.name.clone(), f.size as i64))
+                                .collect::<Vec<(String, i64)>>(),
+                            json!({}),
+                        );
+                    } else if let Some(clip) = msg_2_clip(clip) {
                         #[cfg(target_os = "windows")]
                         {
                             self.send_to_cm(ipc::Data::ClipboardFile(clip));
                         }
                         #[cfg(feature = "unix-file-copy-paste")]
                         if crate::is_support_file_copy_paste(&self.lr.version) {
-                            let mut out_msg = None;
+                            let mut out_msgs = vec![];
 
                             #[cfg(target_os = "macos")]
                             if clipboard::platform::unix::macos::should_handle_msg(&clip) {
@@ -2485,7 +2575,7 @@ impl Connection {
                                         });
                                 }
                             } else {
-                                out_msg = unix_file_clip::serve_clip_messages(
+                                out_msgs = unix_file_clip::serve_clip_messages(
                                     ClipboardSide::Host,
                                     clip,
                                     self.inner.id(),
@@ -2494,14 +2584,31 @@ impl Connection {
 
                             #[cfg(not(target_os = "macos"))]
                             {
-                                out_msg = unix_file_clip::serve_clip_messages(
+                                out_msgs = unix_file_clip::serve_clip_messages(
                                     ClipboardSide::Host,
                                     clip,
                                     self.inner.id(),
                                 );
                             }
 
-                            if let Some(msg) = out_msg {
+                            for msg in out_msgs.into_iter() {
+                                if let Some(message::Union::Cliprdr(cliprdr)) = msg.union.as_ref() {
+                                    if let Some(cliprdr::Union::Files(files)) =
+                                        cliprdr.union.as_ref()
+                                    {
+                                        self.post_file_audit(
+                                            FileAuditType::RemoteSend,
+                                            "",
+                                            files
+                                                .files
+                                                .iter()
+                                                .map(|f| (f.name.clone(), f.size as i64))
+                                                .collect::<Vec<(String, i64)>>(),
+                                            json!({}),
+                                        );
+                                        continue;
+                                    }
+                                }
                                 self.send(msg).await;
                             }
                         }
@@ -2705,7 +2812,11 @@ impl Connection {
                             }
                             Some(file_action::Union::SendConfirm(r)) => {
                                 if let Some(job) = fs::get_job(r.id, &mut self.read_jobs) {
-                                    job.confirm(&r);
+                                    job.confirm(&r).await;
+                                } else {
+                                    if let Ok(sc) = r.write_to_bytes() {
+                                        self.send_fs(ipc::FS::SendConfirm(sc));
+                                    }
                                 }
                             }
                             Some(file_action::Union::Rename(r)) => {
@@ -2749,6 +2860,7 @@ impl Connection {
                         file_size: d.file_size,
                         last_modified: d.last_modified,
                         is_upload: true,
+                        is_resume: d.is_resume,
                     }),
                     Some(file_response::Union::Error(e)) => {
                         self.send_fs(ipc::FS::WriteError {
@@ -3063,35 +3175,134 @@ impl Connection {
         }
     }
 
-    fn update_failure(&self, (mut failure, time): ((i32, i32, i32), i32), remove: bool, i: usize) {
+    // Try to parse connection IP as IPv6 address, returning /64, /56, and /48 prefixes.
+    // Parsing an IPv4 address just returns None.
+    // note: we specifically don't use hbb_common::is_ipv6_str to avoid divergence issues
+    // between its regex and the system std::net::Ipv6Addr implementation.
+    fn get_ipv6_prefixes(&self) -> Option<(String, String, String)> {
+        fn mask_u128(addr: u128, prefix: u8) -> u128 {
+            let mask = if prefix == 0 || prefix > 128 {
+                0
+            } else {
+                (!0u128) << (128 - prefix)
+            };
+            addr & mask
+        }
+        // eliminate zone-ids like "fe80::1%eth0"
+        let ip_only = self.ip.split('%').next().unwrap_or(&self.ip).trim();
+        let ip = Ipv6Addr::from_str(ip_only).ok()?;
+
+        let as_u128 = u128::from_be_bytes(ip.octets());
+
+        let p64 = Ipv6Addr::from(mask_u128(as_u128, 64).to_be_bytes()).to_string() + "/64";
+        let p56 = Ipv6Addr::from(mask_u128(as_u128, 56).to_be_bytes()).to_string() + "/56";
+        let p48 = Ipv6Addr::from(mask_u128(as_u128, 48).to_be_bytes()).to_string() + "/48";
+
+        Some((p64, p56, p48))
+    }
+
+    fn update_failure(&self, (failure, time): ((i32, i32, i32), i32), remove: bool, i: usize) {
+        fn bump(mut cur: (i32, i32, i32), time: i32) -> (i32, i32, i32) {
+            if cur.0 == time {
+                cur.1 += 1;
+                cur.2 += 1;
+            } else {
+                cur.0 = time;
+                cur.1 = 1;
+                cur.2 += 1;
+            }
+            cur
+        }
+        let map_mutex = &LOGIN_FAILURES[i];
         if remove {
             if failure.0 != 0 {
-                LOGIN_FAILURES[i].lock().unwrap().remove(&self.ip);
+                if let Some((p64, p56, p48)) = self.get_ipv6_prefixes() {
+                    let mut m = map_mutex.lock().unwrap();
+                    m.remove(&p64);
+                    m.remove(&p56);
+                    m.remove(&p48);
+                    m.remove(&self.ip);
+                } else {
+                    map_mutex.lock().unwrap().remove(&self.ip);
+                }
             }
             return;
         }
-        if failure.0 == time {
-            failure.1 += 1;
-            failure.2 += 1;
+        // Bump the prefixes, fetching existing values
+        if let Some((p64, p56, p48)) = self.get_ipv6_prefixes() {
+            let mut m = map_mutex.lock().unwrap();
+            for key in [p64, p56, p48] {
+                let cur = m.get(&key).copied().unwrap_or((0, 0, 0));
+                m.insert(key, bump(cur, time));
+            }
+            // Update full IP: bump from the *original* passed-in failure
+            m.insert(self.ip.clone(), bump(failure, time));
         } else {
-            failure.0 = time;
-            failure.1 = 1;
-            failure.2 += 1;
+            // Update full IP: bump from the *original* passed-in failure
+            let mut m = map_mutex.lock().unwrap();
+            m.insert(self.ip.clone(), bump(failure, time));
         }
-        LOGIN_FAILURES[i]
+    }
+
+    async fn check_failure_ipv6_prefix(
+        &mut self,
+        i: usize,
+        time: i32,
+        prefix: &str,
+        prefix_num: i8,
+        thresh: i32,
+    ) -> Option<(((i32, i32, i32), i32), bool)> {
+        let failure_prefix = LOGIN_FAILURES[i]
             .lock()
             .unwrap()
-            .insert(self.ip.clone(), failure);
+            .get(prefix)
+            .copied()
+            .unwrap_or((0, 0, 0));
+
+        if failure_prefix.2 > thresh {
+            self.send_login_error(format!(
+                "Too many wrong attempts for IPv6 prefix /{}",
+                prefix_num
+            ))
+            .await;
+            Self::post_alarm_audit(
+                AlarmAuditType::ExceedIPv6PrefixAttempts,
+                json!({
+                            "ip": self.ip,
+                            "id": self.lr.my_id.clone(),
+                            "name": self.lr.my_name.clone(),
+                }),
+            );
+            Some(((failure_prefix, time), false))
+        } else {
+            None
+        }
     }
 
     async fn check_failure(&mut self, i: usize) -> (((i32, i32, i32), i32), bool) {
+        let time = (get_time() / 60_000) as i32;
+
+        // IPv6 addresses are cheap to make so we check prefix/netblock as well
+        if let Some((p64, p56, p48)) = self.get_ipv6_prefixes() {
+            if let Some(res) = self.check_failure_ipv6_prefix(i, time, &p64, 64, 60).await {
+                return res;
+            }
+            if let Some(res) = self.check_failure_ipv6_prefix(i, time, &p56, 56, 80).await {
+                return res;
+            }
+            if let Some(res) = self.check_failure_ipv6_prefix(i, time, &p48, 48, 100).await {
+                return res;
+            }
+        }
+
+        // checks IPv6 and IPv4 direct addresses
         let failure = LOGIN_FAILURES[i]
             .lock()
             .unwrap()
             .get(&self.ip)
-            .map(|x| x.clone())
+            .copied()
             .unwrap_or((0, 0, 0));
-        let time = (get_time() / 60_000) as i32;
+
         let res = if failure.2 > 30 {
             self.send_login_error("Too many wrong attempts").await;
             Self::post_alarm_audit(
@@ -3590,6 +3801,50 @@ impl Connection {
         if let Ok(q) = o.terminal_persistent.enum_value() {
             if q != BoolOption::NotSet {
                 self.update_terminal_persistence(q == BoolOption::Yes).await;
+            }
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if let Ok(q) = o.show_my_cursor.enum_value() {
+            if q != BoolOption::NotSet {
+                use crate::whiteboard;
+                self.show_my_cursor = q == BoolOption::Yes;
+                #[cfg(target_os = "windows")]
+                let is_lower_win10 = !crate::platform::windows::is_win_10_or_greater();
+                #[cfg(not(target_os = "windows"))]
+                let is_lower_win10 = false;
+                #[cfg(target_os = "linux")]
+                let is_linux_supported = crate::whiteboard::is_supported();
+                #[cfg(not(target_os = "linux"))]
+                let is_linux_supported = false;
+                let not_support_msg = if is_lower_win10 {
+                    "Windows 10 or greater is required."
+                } else if cfg!(target_os = "linux") && !is_linux_supported {
+                    "This feature is not supported on native Wayland, please install XWayland or switch to X11."
+                } else {
+                    ""
+                };
+                if q == BoolOption::Yes {
+                    if not_support_msg.is_empty() {
+                        whiteboard::register_whiteboard(whiteboard::get_key_cursor(self.inner.id));
+                    } else {
+                        let mut msg_out = Message::new();
+                        let res = MessageBox {
+                            msgtype: "nook-nocancel-hasclose".to_owned(),
+                            title: "Show my cursor".to_owned(),
+                            text: not_support_msg.to_owned(),
+                            link: "".to_owned(),
+                            ..Default::default()
+                        };
+                        msg_out.set_message_box(res);
+                        self.send(msg_out).await;
+                    }
+                } else {
+                    if not_support_msg.is_empty() {
+                        whiteboard::unregister_whiteboard(whiteboard::get_key_cursor(
+                            self.inner.id,
+                        ));
+                    }
+                }
             }
         }
     }
@@ -4223,6 +4478,10 @@ pub enum AlarmAuditType {
     IpWhitelist = 0,
     ExceedThirtyAttempts = 1,
     SixAttemptsWithinOneMinute = 2,
+    // ExceedThirtyLoginAttempts = 3,
+    // MultipleLoginsAttemptsWithinOneMinute = 4,
+    // MultipleLoginsAttemptsWithinOneHour = 5,
+    ExceedIPv6PrefixAttempts = 6,
 }
 
 pub enum FileAuditType {
@@ -4744,6 +5003,11 @@ mod raii {
                 scrap::wayland::pipewire::try_close_session();
             }
             Self::check_wake_lock();
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                use crate::whiteboard;
+                whiteboard::unregister_whiteboard(whiteboard::get_key_cursor(self.0));
+            }
         }
     }
 }
@@ -4782,5 +5046,12 @@ mod test {
         let pos = msg.cursor_position();
         assert_eq!(pos.x, 510);
         assert_eq!(pos.y, 510);
+    }
+
+    #[test]
+    fn ipv6() {
+        assert!(Ipv6Addr::from_str("::1").is_ok());
+        assert!(Ipv6Addr::from_str("127.0.0.1").is_err());
+        assert!(Ipv6Addr::from_str("0").is_err());
     }
 }

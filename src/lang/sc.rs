@@ -709,5 +709,17 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Supported only in the installed version.", "Suportadu petzi in sa versione installada."),
         ("elevation_username_tip", "Inserta Nùmene utente o domìniu de fonte\\nùmene Utente"),
         ("Preparing for installation ...", ""),
+        ("Show my cursor", ""),
+        ("Scale custom", ""),
+        ("Custom scale slider", ""),
+        ("Decrease", ""),
+        ("Increase", ""),
+        ("Show virtual mouse", ""),
+        ("Virtual mouse size", ""),
+        ("Small", ""),
+        ("Large", ""),
+        ("Show virtual joystick", ""),
+        ("Edit note", ""),
+        ("Alias", ""),
     ].iter().cloned().collect();
 }

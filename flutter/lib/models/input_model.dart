@@ -371,6 +371,7 @@ class InputModel {
   String get id => parent.target?.id ?? '';
   String? get peerPlatform => parent.target?.ffiModel.pi.platform;
   bool get isViewOnly => parent.target!.ffiModel.viewOnly;
+  bool get showMyCursor => parent.target!.ffiModel.showMyCursor;
   double get devicePixelRatio => parent.target!.canvasModel.devicePixelRatio;
   bool get isViewCamera => parent.target!.connType == ConnType.viewCamera;
   int get trackpadSpeed => _trackpadSpeed;
@@ -765,6 +766,11 @@ class InputModel {
         command: command);
   }
 
+  static Map<String, dynamic> getMouseEventMove() => {
+        'type': _kMouseEventMove,
+        'buttons': 0,
+      };
+
   Map<String, dynamic> _getMouseEvent(PointerEvent evt, String type) {
     final Map<String, dynamic> out = {};
 
@@ -876,7 +882,7 @@ class InputModel {
 
   void onPointHoverImage(PointerHoverEvent e) {
     _stopFling = true;
-    if (isViewOnly) return;
+    if (isViewOnly && !showMyCursor) return;
     if (e.kind != ui.PointerDeviceKind.mouse) return;
     if (!isPhysicalMouse.value) {
       isPhysicalMouse.value = true;
@@ -1037,7 +1043,7 @@ class InputModel {
     if (isDesktop) _queryOtherWindowCoords = true;
     _remoteWindowCoords = [];
     _windowRect = null;
-    if (isViewOnly) return;
+    if (isViewOnly && !showMyCursor) return;
     if (isViewCamera) return;
     if (e.kind != ui.PointerDeviceKind.mouse) {
       if (isPhysicalMouse.value) {
@@ -1051,7 +1057,7 @@ class InputModel {
 
   void onPointUpImage(PointerUpEvent e) {
     if (isDesktop) _queryOtherWindowCoords = false;
-    if (isViewOnly) return;
+    if (isViewOnly && !showMyCursor) return;
     if (isViewCamera) return;
     if (e.kind != ui.PointerDeviceKind.mouse) return;
     if (isPhysicalMouse.value) {
@@ -1060,7 +1066,7 @@ class InputModel {
   }
 
   void onPointMoveImage(PointerMoveEvent e) {
-    if (isViewOnly) return;
+    if (isViewOnly && !showMyCursor) return;
     if (isViewCamera) return;
     if (e.kind != ui.PointerDeviceKind.mouse) return;
     if (_queryOtherWindowCoords) {
@@ -1221,16 +1227,17 @@ class InputModel {
     return false;
   }
 
-  void handleMouse(
+  Map<String, dynamic>? processEventToPeer(
     Map<String, dynamic> evt,
     Offset offset, {
     bool onExit = false,
+    bool moveCanvas = true,
   }) {
-    if (isViewCamera) return;
+    if (isViewCamera) return null;
     double x = offset.dx;
     double y = max(0.0, offset.dy);
     if (_checkPeerControlProtected(x, y)) {
-      return;
+      return null;
     }
 
     var type = kMouseEventTypeDefault;
@@ -1247,7 +1254,7 @@ class InputModel {
         isMove = true;
         break;
       default:
-        return;
+        return null;
     }
     evt['type'] = type;
 
@@ -1265,9 +1272,10 @@ class InputModel {
       type,
       onExit: onExit,
       buttons: evt['buttons'],
+      moveCanvas: moveCanvas,
     );
     if (pos == null) {
-      return;
+      return null;
     }
     if (type != '') {
       evt['x'] = '0';
@@ -1285,7 +1293,22 @@ class InputModel {
       kForwardMouseButton: 'forward'
     };
     evt['buttons'] = mapButtons[evt['buttons']] ?? '';
-    bind.sessionSendMouse(sessionId: sessionId, msg: json.encode(modify(evt)));
+    return evt;
+  }
+
+  Map<String, dynamic>? handleMouse(
+    Map<String, dynamic> evt,
+    Offset offset, {
+    bool onExit = false,
+    bool moveCanvas = true,
+  }) {
+    final evtToPeer =
+        processEventToPeer(evt, offset, onExit: onExit, moveCanvas: moveCanvas);
+    if (evtToPeer != null) {
+      bind.sessionSendMouse(
+          sessionId: sessionId, msg: json.encode(modify(evtToPeer)));
+    }
+    return evtToPeer;
   }
 
   Point? handlePointerDevicePos(
@@ -1296,6 +1319,7 @@ class InputModel {
     String evtType, {
     bool onExit = false,
     int buttons = kPrimaryMouseButton,
+    bool moveCanvas = true,
   }) {
     final ffiModel = parent.target!.ffiModel;
     CanvasCoords canvas =
@@ -1312,15 +1336,19 @@ class InputModel {
           isMove = false;
           canvas = coords.canvas;
           rect = coords.remoteRect;
-          x -= coords.relativeOffset.dx / devicePixelRatio;
-          y -= coords.relativeOffset.dy / devicePixelRatio;
+          x -= isWindows
+              ? coords.relativeOffset.dx / devicePixelRatio
+              : coords.relativeOffset.dx;
+          y -= isWindows
+              ? coords.relativeOffset.dy / devicePixelRatio
+              : coords.relativeOffset.dy;
         }
       }
     }
 
     y -= CanvasModel.topToEdge;
     x -= CanvasModel.leftToEdge;
-    if (isMove) {
+    if (isMove && moveCanvas) {
       parent.target!.canvasModel.moveDesktopMouse(x, y);
     }
 
@@ -1338,15 +1366,21 @@ class InputModel {
   }
 
   bool _isInCurrentWindow(double x, double y) {
-    final w = _windowRect!.width / devicePixelRatio;
-    final h = _windowRect!.width / devicePixelRatio;
+    var w = _windowRect!.width;
+    var h = _windowRect!.height;
+    if (isWindows) {
+      w /= devicePixelRatio;
+      h /= devicePixelRatio;
+    }
     return x >= 0 && y >= 0 && x <= w && y <= h;
   }
 
   static RemoteWindowCoords? findRemoteCoords(double x, double y,
       List<RemoteWindowCoords> remoteWindowCoords, double devicePixelRatio) {
-    x *= devicePixelRatio;
-    y *= devicePixelRatio;
+    if (isWindows) {
+      x *= devicePixelRatio;
+      y *= devicePixelRatio;
+    }
     for (final c in remoteWindowCoords) {
       if (x >= c.relativeOffset.dx &&
           y >= c.relativeOffset.dy &&

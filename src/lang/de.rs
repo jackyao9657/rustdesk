@@ -709,5 +709,17 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Supported only in the installed version.", "Wird nur in der installierten Version unterstützt."),
         ("elevation_username_tip", "Geben Sie Benutzername oder Domäne\\Benutzername ein"),
         ("Preparing for installation ...", "Installation wird vorbereitet …"),
+        ("Show my cursor", "Meinen Cursor anzeigen"),
+        ("Scale custom", "Benutzerdefinierte Skalierung"),
+        ("Custom scale slider", "Schieberegler für benutzerdefinierte Skalierung"),
+        ("Decrease", "Verringern"),
+        ("Increase", "Erhöhen"),
+        ("Show virtual mouse", "Virtuelle Maus anzeigen"),
+        ("Virtual mouse size", "Virtuelle Mausgröße"),
+        ("Small", "Klein"),
+        ("Large", "Groß"),
+        ("Show virtual joystick", "Virtuellen Joystick anzeigen"),
+        ("Edit note", "Hinweis bearbeiten"),
+        ("Alias", "Alias"),
     ].iter().cloned().collect();
 }
